@@ -1,0 +1,10 @@
+# Ingore Binaries
+Binaries/
+
+# Ignore content folders
+Content/
+
+# Ignore intermediate folders
+Intermediate/
+obj/
+
