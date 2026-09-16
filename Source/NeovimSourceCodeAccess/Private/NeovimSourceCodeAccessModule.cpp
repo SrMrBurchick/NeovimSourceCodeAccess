@@ -4,6 +4,8 @@
 
 IMPLEMENT_MODULE(FNeovimSourceCodeAccessModule, NeovimSourceCodeAccess);
 
+DEFINE_LOG_CATEGORY_STATIC(LogNeovimSourceCodeAccessModule, Log, All);
+
 #define LOCTEXT_NAMESPACE "NeovimSourceCodeAccessor"
 
 FNeovimSourceCodeAccessModule::FNeovimSourceCodeAccessModule()
@@ -13,11 +15,15 @@ FNeovimSourceCodeAccessModule::FNeovimSourceCodeAccessModule()
 
 void FNeovimSourceCodeAccessModule::StartupModule()
 {
+	UE_LOG(LogNeovimSourceCodeAccessModule, Log, TEXT("[NeovimSourceCodeAccess] StartupModule BEGIN"));
 	NeovimSourceCodeAccessor->Startup();
 
 	// Bind our source control provider to the editor
+	UE_LOG(LogNeovimSourceCodeAccessModule, Log, TEXT("[NeovimSourceCodeAccess] Registering accessor BEGIN"));
 	IModularFeatures::Get().RegisterModularFeature(TEXT("SourceCodeAccessor"),
-												&NeovimSourceCodeAccessor.Get());
+											&NeovimSourceCodeAccessor.Get());
+	UE_LOG(LogNeovimSourceCodeAccessModule, Log, TEXT("[NeovimSourceCodeAccess] Registering accessor END"));
+	UE_LOG(LogNeovimSourceCodeAccessModule, Log, TEXT("[NeovimSourceCodeAccess] StartupModule END"));
 }
 
 void FNeovimSourceCodeAccessModule::ShutdownModule()

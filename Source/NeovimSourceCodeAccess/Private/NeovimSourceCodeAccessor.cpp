@@ -1,29 +1,70 @@
 #include "NeovimSourceCodeAccessor.h"
 #include "NeovimCodeAccessorSettings.h"
-#include "NeovimSourceCodeAccessModule.h"
-#include "ISourceCodeAccessModule.h"
-#include "Modules/ModuleManager.h"
-#include "DesktopPlatformModule.h"
 #include "Misc/Paths.h"
 #include "Misc/ScopeLock.h"
-#include "Misc/UProjectInfo.h"
-#include "Misc/App.h"
-
-#if PLATFORM_WINDOWS
-	#include "Windows/AllowWindowsPlatformTypes.h"
-#endif
-#include "Internationalization/Regex.h"
+#include "Misc/SecureHash.h"
+#include "Async/Async.h"
+#include "HAL/FileManager.h"
+#include "HAL/PlatformMisc.h"
+#include "HAL/PlatformTime.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogNeovimCodeAccessor, Log, All);
 
 #define LOCTEXT_NAMESPACE "NeovimSourceCodeAccessor"
 
-FNeovimSourceCodeAccessor::FNeovimSourceCodeAccessor()
-	:bIsRemoteRunning(false)
+namespace
 {
-	RemoteServerURL =
-		GetDefault<UNeovimCodeAccessorSettings>()->RemoteExecutionURL;
+	FString QuoteProcessArgument(const FString& Argument)
+	{
+		FString Escaped = Argument.Replace(TEXT("\""), TEXT("\\\""));
+		return FString::Printf(TEXT("\"%s\""), *Escaped);
+	}
 
+	FString FindExecutableOnPath(const FString& ConfiguredExecutable)
+	{
+		if (FPaths::FileExists(ConfiguredExecutable))
+		{
+			return FPaths::ConvertRelativePathToFull(ConfiguredExecutable);
+		}
+
+		FString ExecutableName = ConfiguredExecutable;
+#if PLATFORM_WINDOWS
+		if (FPaths::GetExtension(ExecutableName).IsEmpty())
+		{
+			ExecutableName += TEXT(".exe");
+		}
+#endif
+
+		TArray<FString> SearchDirectories;
+		FPlatformMisc::GetEnvironmentVariable(TEXT("PATH")).ParseIntoArray(
+			SearchDirectories,
+#if PLATFORM_WINDOWS
+			TEXT(";"),
+#else
+			TEXT(":"),
+#endif
+			true);
+
+		for (const FString& Directory : SearchDirectories)
+		{
+			const FString Candidate = FPaths::Combine(Directory, ExecutableName);
+			if (FPaths::FileExists(Candidate))
+			{
+				return Candidate;
+			}
+		}
+
+		return FString();
+	}
+}
+
+FNeovimSourceCodeAccessor::FNeovimSourceCodeAccessor()
+	: bIsAvailable(true)
+	, bIsShuttingDown(false)
+{
+	const UNeovimCodeAccessorSettings* Settings = GetDefault<UNeovimCodeAccessorSettings>();
+	NeovideExecutable = Settings->NeovideExecutable;
+	NeovideRPCAddress = Settings->NeovideRPCAddress;
 }
 
 FString FNeovimSourceCodeAccessor::GetSolutionPath() const
@@ -39,101 +80,62 @@ FString FNeovimSourceCodeAccessor::GetSolutionPath() const
 	return CachedSolutionPath;
 }
 
-/** save all open documents in visual studio, when recompiling */
-static void OnModuleCompileStarted(bool bIsAsyncCompile)
-{
-	UE_LOG(LogNeovimCodeAccessor, Log, TEXT("OnModuleCompileStarted"));
-	FNeovimSourceCodeAccessModule& NeovimSourceCodeAccessModule =
-		FModuleManager::LoadModuleChecked<FNeovimSourceCodeAccessModule>(TEXT("NeovimSourceCodeAccess"));
-	NeovimSourceCodeAccessModule.GetAccessor().SaveAllOpenDocuments();
-}
-
 void FNeovimSourceCodeAccessor::Startup()
 {
-	UE_LOG(LogNeovimCodeAccessor, Log, TEXT("Startup"));
+	UE_LOG(LogNeovimCodeAccessor, Log, TEXT("[NeovimSourceCodeAccess] Accessor Startup BEGIN"));
 	GetSolutionPath();
-	RefreshAvailability();
+	if (NeovideRPCAddress.IsEmpty())
+	{
+		const FString ProjectKey = FMD5::HashAnsiString(*GetSolutionPath()).Left(16);
+#if PLATFORM_WINDOWS
+		NeovideRPCAddress = FString::Printf(TEXT("//./pipe/neovide-unreal-%s"), *ProjectKey);
+#else
+		FString RuntimeDirectory = FPlatformMisc::GetEnvironmentVariable(TEXT("XDG_RUNTIME_DIR"));
+		if (RuntimeDirectory.IsEmpty())
+		{
+			RuntimeDirectory = FPlatformProcess::UserTempDir();
+		}
+		NeovideRPCAddress = FPaths::Combine(
+			RuntimeDirectory, FString::Printf(TEXT("neovide-unreal-%s.sock"), *ProjectKey));
+#endif
+	}
+	// Do not probe or launch external processes while Unreal is loading
+	// Default-phase modules. Availability is refreshed asynchronously on demand.
+	UE_LOG(LogNeovimCodeAccessor, Log, TEXT("[NeovimSourceCodeAccess] Accessor Startup END"));
 }
 
 void FNeovimSourceCodeAccessor::RefreshAvailability()
 {
-	TArray<FString> Args = { TEXT(":echo \"Test\"<CR>") };
-#if PLATFORM_WINDOWS
-	/* TODO */
-	Location.URL = TEXT("nvim.exe");
-
-#elif PLATFORM_LINUX
-	FString OutURL;
-	int32 ReturnCode = -1;
-
-	FPlatformProcess::ExecProcess(TEXT("/bin/bash"), TEXT("-c \"type -p nvim\""),
-								&ReturnCode, &OutURL, nullptr);
-
-	if (ReturnCode == 0)
-	{
-		Location.URL = OutURL.TrimStartAndEnd();
-	}
-	else
-	{
-		// Fallback to default install location
-		FString URL = TEXT("/usr/bin/nvim");
-		if (FPaths::FileExists(URL))
-		{
-			Location.URL = URL;
-		}
-	}
-
-#elif PLATFORM_MAC
-	/* TODO */
-	Location.URL = TEXT("nvim");
-#endif
-
-	bIsRemoteRunning = SendRemote(Args);
-
+	UE_LOG(LogNeovimCodeAccessor, Log, TEXT("[NeovimSourceCodeAccess] RefreshAvailability BEGIN"));
+	// Availability is intentionally optimistic. Executable discovery and RPC
+	// probing are lazy and happen only in response to an open request.
+	bIsAvailable.Store(true);
+	UE_LOG(LogNeovimCodeAccessor, Log, TEXT("[NeovimSourceCodeAccess] RefreshAvailability END"));
 }
 
 void FNeovimSourceCodeAccessor::Shutdown()
 {
-	if (bIsRemoteRunning) {
-		TArray<FString> Args = { TEXT(":qa!<CR>") };
-		SaveAllOpenDocuments();
-		Launch(Args);
-		bIsRemoteRunning = false;
+	bIsShuttingDown.Store(true);
+	TArray<TFuture<void>> TasksToJoin;
+	{
+		FScopeLock TasksLock(&PendingTasksCriticalSection);
+		TasksToJoin = MoveTemp(PendingTasks);
+	}
+	for (TFuture<void>& Task : TasksToJoin)
+	{
+		Task.Wait();
 	}
 }
 
 bool FNeovimSourceCodeAccessor::OpenSourceFiles(
 	const TArray<FString>& AbsoluteSourcePaths)
 {
-	bool result = false;
-	if (Location.IsValid())
+	bool bAcceptedAll = true;
+	for (const FString& SourcePath : AbsoluteSourcePaths)
 	{
-		FString SolutionDir = GetSolutionPath();
-		TArray<FString> Args;
-
-		Args.Add(TEXT(":"));
-		if (!bIsRemoteRunning) {
-			OpenSolution();
-		}
-
-		for (const FString& SourcePath : AbsoluteSourcePaths)
-		{
-			Args.Add(TEXT("e "));
-			Args.Add(SourcePath);
-			Args.Add(TEXT("|"));
-		}
-
-		Args.Add(TEXT("<CR>"));
-
-		result = Launch(Args);
-
-		/* If remote accessor was closed must be reopend */
-		if (!result && !bIsRemoteRunning) {
-			return OpenSourceFiles(AbsoluteSourcePaths);
-		}
+		bAcceptedAll &= OpenFileAtLine(SourcePath, 1, 1);
 	}
-
-	return result;
+	return bAcceptedAll;
 }
 
 bool FNeovimSourceCodeAccessor::AddSourceFiles(
@@ -147,14 +149,31 @@ bool FNeovimSourceCodeAccessor::AddSourceFiles(
 bool FNeovimSourceCodeAccessor::OpenFileAtLine(const FString& FullPath,
 	int32 LineNumber, int32 ColumnNumber)
 {
-	/* TODO: Implement ability to open file at specified line */
-	return false;
+	const FString AbsolutePath = FPaths::ConvertRelativePathToFull(FullPath);
+	TSharedRef<FNeovimSourceCodeAccessor> Self = AsShared();
+	FScopeLock TasksLock(&PendingTasksCriticalSection);
+	if (bIsShuttingDown.Load())
+	{
+		return false;
+	}
+	PendingTasks.Add(Async(EAsyncExecution::ThreadPool, [Self, AbsolutePath, LineNumber, ColumnNumber]()
+	{
+		FScopeLock Lock(&Self->RemoteOperationCriticalSection);
+		if (Self->bIsShuttingDown.Load())
+		{
+			return;
+		}
+		Self->OpenFileAtLineBlocking(AbsolutePath, LineNumber, ColumnNumber);
+	}));
+
+	// The request was accepted. RPC and process launch work is deliberately
+	// performed off the editor thread.
+	return true;
 }
 
 bool FNeovimSourceCodeAccessor::CanAccessSourceCode() const
 {
-	// True if we have any versions of VS installed
-	return Location.IsValid();
+	return bIsAvailable.Load();
 }
 
 FName FNeovimSourceCodeAccessor::GetFName() const
@@ -178,143 +197,168 @@ void FNeovimSourceCodeAccessor::Tick(const float DeltaTime)
 
 bool FNeovimSourceCodeAccessor::OpenSolution()
 {
-	if (Location.IsValid())
-	{
-		return OpenSolutionAtPath(GetSolutionPath());
-	}
-
 	return false;
 }
 
 bool FNeovimSourceCodeAccessor::OpenSolutionAtPath(const FString& InSolutionPath)
 {
-	if (Location.IsValid())
-	{
-		FString SolutionPath = InSolutionPath;
-
-		TArray<FString> Args;
-
-		Args.Add(FString::Printf(TEXT(":cd %s <CR>"), *InSolutionPath));
-		return Launch(Args);
-	}
-
 	return false;
-}
-
-bool FNeovimSourceCodeAccessor::IsRunInTerminal() const
-{
-	return GetDefault<UNeovimCodeAccessorSettings>()->bStartInTerminal
-			&& !GetDefault<UNeovimCodeAccessorSettings>()->RemoteExecutionTerminal.IsEmpty()
-			&& !GetDefault<UNeovimCodeAccessorSettings>()->RemoteExecutionTerminalOpts.IsEmpty();
 }
 
 bool FNeovimSourceCodeAccessor::DoesSolutionExist() const
 {
-	return FPaths::FileExists(GetSolutionPath());
+	return FPaths::DirectoryExists(GetSolutionPath());
 }
 
 bool FNeovimSourceCodeAccessor::SaveAllOpenDocuments() const
 {
-	if (bIsRemoteRunning) {
-		TArray<FString> Args = { TEXT(":wa<CR>") };
-		return const_cast<FNeovimSourceCodeAccessor*>(this)->Launch(Args);
-	}
-
 	return false;
 }
 
-FString FNeovimSourceCodeAccessor::PrepareRemoteCommand()
+FString FNeovimSourceCodeAccessor::GetNeovideRPCAddress() const
 {
-	FString ArgsString;
-
-	if (RemoteServerURL.IsEmpty()) {
-		UE_LOG(LogNeovimCodeAccessor, Error,
-		 TEXT("Remote server not specified!"));
-
-		return ArgsString;
-	}
-	ArgsString.Append(FString::Printf(TEXT("--server %s"), *RemoteServerURL));
-
-	ArgsString.Append(TEXT(" "));
-	ArgsString.Append(TEXT("--remote-send"));
-	ArgsString.Append(TEXT(" "));
-
-	return ArgsString;
+	return NeovideRPCAddress;
 }
 
-bool FNeovimSourceCodeAccessor::SendRemote(const TArray<FString>& InArgs)
+bool FNeovimSourceCodeAccessor::EnsureNeovimExecutable()
 {
-	FString OutURL;
+	if (!Location.IsValid())
+	{
+		Location.URL = FindExecutableOnPath(TEXT("nvim"));
+	}
+	bIsAvailable.Store(Location.IsValid());
+	return Location.IsValid();
+}
+
+bool FNeovimSourceCodeAccessor::RunProcessWithTimeout(const FString& Executable, const FString& Arguments,
+	double TimeoutSeconds, int32& OutReturnCode) const
+{
+	OutReturnCode = -1;
+	FProcHandle Process = FPlatformProcess::CreateProc(*Executable, *Arguments, true, true, true,
+		nullptr, 0, nullptr, nullptr);
+	if (!Process.IsValid())
+	{
+		return false;
+	}
+
+	const double Deadline = FPlatformTime::Seconds() + TimeoutSeconds;
+	while (FPlatformProcess::IsProcRunning(Process) && FPlatformTime::Seconds() < Deadline)
+	{
+		FPlatformProcess::Sleep(0.02f);
+	}
+
+	if (FPlatformProcess::IsProcRunning(Process))
+	{
+		UE_LOG(LogNeovimCodeAccessor, Warning,
+			TEXT("[NeovimSourceCodeAccess] Process timed out; terminating %s"), *Executable);
+		FPlatformProcess::TerminateProc(Process, true);
+		FPlatformProcess::CloseProc(Process);
+		return false;
+	}
+
+	const bool bGotReturnCode = FPlatformProcess::GetProcReturnCode(Process, &OutReturnCode);
+	FPlatformProcess::CloseProc(Process);
+	return bGotReturnCode;
+}
+
+bool FNeovimSourceCodeAccessor::IsNeovideServerAlive()
+{
+	if (!EnsureNeovimExecutable())
+	{
+		return false;
+	}
+
 	int32 ReturnCode = -1;
-	FString RemoteCommand = PrepareRemoteCommand();
+	const FString Arguments = FString::Printf(TEXT("--server %s --remote-expr %s"),
+		*QuoteProcessArgument(GetNeovideRPCAddress()), *QuoteProcessArgument(TEXT("1")));
+	return RunProcessWithTimeout(Location.URL, Arguments, 1.0, ReturnCode) && ReturnCode == 0;
+}
 
-	if (Location.IsValid() && !RemoteCommand.IsEmpty())
+bool FNeovimSourceCodeAccessor::LaunchNeovide()
+{
+	const FString ResolvedNeovideExecutable = FindExecutableOnPath(NeovideExecutable);
+	if (ResolvedNeovideExecutable.IsEmpty())
 	{
-		FString ArgsString;
-		ArgsString.Append(RemoteCommand);
+		UE_LOG(LogNeovimCodeAccessor, Error,
+			TEXT("[NeovimSourceCodeAccess] Cannot find Neovide executable '%s'"), *NeovideExecutable);
+		return false;
+	}
 
-		ArgsString.Append(TEXT("\""));
-		for (const FString& Arg : InArgs)
+	const FString RPCAddress = GetNeovideRPCAddress();
+#if !PLATFORM_WINDOWS
+	// A crashed server can leave a socket node behind. It is safe to remove only
+	// after the RPC probe has failed and before starting this project's server.
+	IFileManager::Get().Delete(*RPCAddress, false, true);
+#endif
+
+	const FString Arguments = FString::Printf(TEXT("-- --listen %s"), *QuoteProcessArgument(RPCAddress));
+	UE_LOG(LogNeovimCodeAccessor, Log,
+		TEXT("[NeovimSourceCodeAccess] Launching Neovide (Executable=%s, Server=%s)"),
+		*ResolvedNeovideExecutable, *RPCAddress);
+	FProcHandle Process = FPlatformProcess::CreateProc(*ResolvedNeovideExecutable, *Arguments, true, false, false,
+		nullptr, 0, *GetSolutionPath(), nullptr);
+	const bool bStarted = Process.IsValid();
+	if (bStarted)
+	{
+		FPlatformProcess::CloseProc(Process);
+	}
+	return bStarted;
+}
+
+bool FNeovimSourceCodeAccessor::OpenFileAtLineBlocking(const FString& FullPath, int32 LineNumber, int32 ColumnNumber)
+{
+	UE_LOG(LogNeovimCodeAccessor, Log,
+		TEXT("[NeovimSourceCodeAccess] OpenFileAtLine worker BEGIN (File=%s, Line=%d, Column=%d)"),
+		*FullPath, LineNumber, ColumnNumber);
+
+	if (!IsNeovideServerAlive())
+	{
+		if (!LaunchNeovide())
 		{
-			ArgsString.Append(Arg);
+			return false;
 		}
-		ArgsString.Append(TEXT("\""));
 
-		FPlatformProcess::ExecProcess(*Location.URL, *ArgsString, &ReturnCode,
-									&OutURL, nullptr);
-
-		bIsRemoteRunning = ReturnCode == 0;
+		const double Deadline = FPlatformTime::Seconds() + 10.0;
+		bool bServerReady = false;
+		while (!bIsShuttingDown.Load() && FPlatformTime::Seconds() < Deadline)
+		{
+			bServerReady = IsNeovideServerAlive();
+			if (bServerReady)
+			{
+				break;
+			}
+			FPlatformProcess::Sleep(0.1f);
+		}
+		if (!bServerReady)
+		{
+			UE_LOG(LogNeovimCodeAccessor, Error,
+				TEXT("[NeovimSourceCodeAccess] Neovide RPC endpoint did not become ready: %s"),
+				*GetNeovideRPCAddress());
+			return false;
+		}
 	}
 
-	return bIsRemoteRunning;
-}
-
-void FNeovimSourceCodeAccessor::StartRemoteNeovimServer()
-{
-	FString RemoteServer =
-		GetDefault<UNeovimCodeAccessorSettings>()->RemoteExecutionURL;
-	FString RemoteTerminal =
-		GetDefault<UNeovimCodeAccessorSettings>()->RemoteExecutionTerminal;
-	/* Terminal opts that provides ability to run command with terminal opening */
-	FString RemoteTerminalOpts =
-		GetDefault<UNeovimCodeAccessorSettings>()->RemoteExecutionTerminalOpts;
-
-
-	if (Location.IsValid() && !RemoteServer.IsEmpty())
+	int32 ReturnCode = -1;
+	const FString OpenArguments = FString::Printf(TEXT("--server %s --remote %s"),
+		*QuoteProcessArgument(GetNeovideRPCAddress()), *QuoteProcessArgument(FullPath));
+	if (!RunProcessWithTimeout(Location.URL, OpenArguments, 2.0, ReturnCode) || ReturnCode != 0)
 	{
-		FString ArgsString;
-		bool bSuccess = false;
-
-		Location.URL = RemoteTerminal;
-
-		ArgsString.Append(RemoteTerminalOpts);
-		ArgsString.Append(TEXT(" "));
-		ArgsString.Append(TEXT("nvim"));
-		ArgsString.Append(TEXT(" "));
-		ArgsString.Append(FString::Printf(TEXT("--listen %s"), *RemoteServer));
-
-		FProcHandle WorkerHandle = FPlatformProcess::CreateProc(*Location.URL,
-																*ArgsString,
-																true, false,
-																false, nullptr,
-																0, nullptr,
-																nullptr);
-		bSuccess = WorkerHandle.IsValid();
-		FPlatformProcess::CloseProc(WorkerHandle);
-
-		bIsRemoteRunning = bSuccess;
-		RefreshAvailability();
-	}
-}
-
-bool FNeovimSourceCodeAccessor::Launch(const TArray<FString>& InArgs)
-{
-	/* Is remote not runing and terminal command has provided then remote server must be started */
-	if (!bIsRemoteRunning && IsRunInTerminal()) {
-		StartRemoteNeovimServer();
+		UE_LOG(LogNeovimCodeAccessor, Error,
+			TEXT("[NeovimSourceCodeAccess] Failed to open file in Neovide (ReturnCode=%d)"), ReturnCode);
+		return false;
 	}
 
-	return SendRemote(InArgs);
+	const int32 SafeLine = FMath::Max(1, LineNumber);
+	const int32 SafeColumn = FMath::Max(1, ColumnNumber);
+	const FString CursorExpression = FString::Printf(TEXT("cursor(%d,%d)"), SafeLine, SafeColumn);
+	const FString CursorArguments = FString::Printf(TEXT("--server %s --remote-expr %s"),
+		*QuoteProcessArgument(GetNeovideRPCAddress()), *QuoteProcessArgument(CursorExpression));
+	const bool bMovedCursor = RunProcessWithTimeout(Location.URL, CursorArguments, 2.0, ReturnCode)
+		&& ReturnCode == 0;
+	UE_LOG(LogNeovimCodeAccessor, Log,
+		TEXT("[NeovimSourceCodeAccess] OpenFileAtLine worker END (Success=%s)"),
+		bMovedCursor ? TEXT("true") : TEXT("false"));
+	return bMovedCursor;
 }
 
 #undef LOCTEXT_NAMESPACE

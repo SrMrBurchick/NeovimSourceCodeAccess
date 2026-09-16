@@ -18,23 +18,14 @@ public:
 	UNeovimCodeAccessorSettings();
 
 #if WITH_EDITOR
-	//~ UObject interface
-	virtual bool CanEditChange(const FProperty* InProperty) const override;
-	virtual void PostEditChangeProperty(struct FPropertyChangedEvent& PropertyChangedEvent) override;
-
 	//~ UDeveloperSettings interface
 	virtual FText GetSectionText() const override;
 #endif
 
-	/** The neovim server address that the code accessor should bind to */
-	UPROPERTY(config, EditAnywhere, Category = Neovim, meta = (ConfigRestartRequired=true, DisplayName = "Neovim remote server url"))
-	FString RemoteExecutionURL;
-	UPROPERTY(config, EditAnywhere, Category = Terminal, meta = (DisplayName = "Start in terminal"))
-	bool bStartInTerminal;
-	UPROPERTY(config, EditAnywhere, Category = Terminal, AdvancedDisplay, meta = (ConfigRestartRequired=true, DisplayName = "Terminal path"))
-	FString RemoteExecutionTerminal;
-	UPROPERTY(config, EditAnywhere, Category = Terminal, AdvancedDisplay, meta = (ConfigRestartRequired=true, DisplayName = "Terminal options to execute command"))
-	FString RemoteExecutionTerminalOpts;
-
-
+	/** Neovide executable name or absolute path. */
+	UPROPERTY(config, EditAnywhere, Category = Neovim, meta = (DisplayName = "Neovide executable"))
+	FString NeovideExecutable;
+	/** Optional RPC address override. Empty creates a stable per-project socket/pipe. */
+	UPROPERTY(config, EditAnywhere, Category = Neovim, AdvancedDisplay, meta = (DisplayName = "Neovide RPC address"))
+	FString NeovideRPCAddress;
 };

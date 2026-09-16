@@ -1,8 +1,9 @@
 #pragma once
 
 #include "ISourceCodeAccessor.h"
+#include "Async/Future.h"
 
-class FNeovimSourceCodeAccessor : public ISourceCodeAccessor
+class FNeovimSourceCodeAccessor : public ISourceCodeAccessor, public TSharedFromThis<FNeovimSourceCodeAccessor>
 {
 public:
 	FNeovimSourceCodeAccessor();
@@ -49,23 +50,24 @@ private:
 	/** Critical section for updating SolutionPath */
 	mutable FCriticalSection CachedSolutionPathCriticalSection;
 
-	/** Flag of the neovim server running */
-	bool bIsRemoteRunning;
-	/** Neovim --server flag argument. The neovim running server url */
-	FString RemoteServerURL;
+	/** Cached accessor availability; updated by background probes. */
+	TAtomic<bool> bIsAvailable;
+	TAtomic<bool> bIsShuttingDown;
+	/** Serializes endpoint probing, Neovide launch, and remote open requests. */
+	FCriticalSection RemoteOperationCriticalSection;
+	/** Keeps background work alive and joinable during module shutdown. */
+	FCriticalSection PendingTasksCriticalSection;
+	TArray<TFuture<void>> PendingTasks;
+	FString NeovideExecutable;
+	FString NeovideRPCAddress;
 
 	/** Accessor for SolutionPath. Will try to update it when called from the game thread, otherwise will use the cached value */
 	FString GetSolutionPath() const;
 
-	/** Helper function for sending commands to the running neovim server */
-	bool SendRemote(const TArray<FString>& InArgs);
-	/** Checks if terminal app and opts was provided */
-	bool IsRunInTerminal() const;
-	/** Runs neovim server in the new terminal window */
-	void StartRemoteNeovimServer();
-	/** Helper function that prepares basic neovim remote command options */
-	FString PrepareRemoteCommand();
-
-	/** Helper function for launching the neovim instance with the given list of arguments */
-	bool Launch(const TArray<FString>& InArgs);
+	FString GetNeovideRPCAddress() const;
+	bool EnsureNeovimExecutable();
+	bool IsNeovideServerAlive();
+	bool LaunchNeovide();
+	bool OpenFileAtLineBlocking(const FString& FullPath, int32 LineNumber, int32 ColumnNumber);
+	bool RunProcessWithTimeout(const FString& Executable, const FString& Arguments, double TimeoutSeconds, int32& OutReturnCode) const;
 };
